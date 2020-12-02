@@ -32,8 +32,10 @@ import qualified Control.Monad.Except                          as Except
 import qualified Control.Monad.Fail                            as Fail
 import           Control.Monad.Reader                          hiding (fail, fix)
 import           Control.Monad.State                           hiding (fail, fix, state)
+import           Data.Char                                     (isDigit)
 import           Data.List                                     (intersperse, sortOn)
 import           Data.Maybe                                    (fromMaybe)
+import qualified Data.Set                                      as Set
 import           Prelude                                       hiding (fail)
 import           Text.PrettyPrint.ANSI.Leijen                  hiding ((<$>))
 
@@ -71,14 +73,33 @@ data TranslationState = TranslationState
   -- the term.  The translation function itself will return only the declaration
   -- for the term being translated.
 
-  , _localEnvironment  :: [String]
-  -- ^ TODO: describe me
+  , _localEnvironment  :: [Coq.Ident]
+  -- ^ The list of Coq identifiers for de Bruijn-indexed local
+  -- variables, innermost (index 0) first.
+
+  , _unavailableIdents :: Set.Set Coq.Ident
+  -- ^ The set of Coq identifiers that are either reserved or already
+  -- in use. To avoid shadowing, fresh identifiers should be chosen to
+  -- be disjoint from this set.
 
   , _currentModule :: Maybe ModuleName
   }
   deriving (Show)
 
 makeLenses ''TranslationState
+
+-- | The set of reserved identifiers in Coq, obtained from section
+-- "Gallina Specification Language" of the Coq reference manual.
+-- <https://coq.inria.fr/refman/language/gallina-specification-language.html>
+reservedIdents :: Set.Set Coq.Ident
+reservedIdents =
+  Set.fromList $
+  concatMap words $
+  [ "_ Axiom CoFixpoint Definition Fixpoint Hypothesis IF Parameter Prop"
+  , "SProp Set Theorem Type Variable as at by cofix discriminated else"
+  , "end exists exists2 fix for forall fun if in lazymatch let match"
+  , "multimatch return then using where with"
+  ]
 
 -- | Extract the list of names from a list of Coq declarations.  Not all
 -- declarations have names, e.g. comments and code snippets come without names.
@@ -108,7 +129,7 @@ runTermTranslationMonad ::
   TranslationConfiguration ->
   Maybe ModuleName ->
   [String] ->
-  [String] ->
+  [Coq.Ident] ->
   (forall m. TermTranslationMonad m => m a) ->
   Either (TranslationError Term) (a, TranslationState)
 runTermTranslationMonad configuration modname globalDecls localEnv =
@@ -116,6 +137,7 @@ runTermTranslationMonad configuration modname globalDecls localEnv =
   (TranslationState { _globalDeclarations = globalDecls
                     , _localDeclarations  = []
                     , _localEnvironment   = localEnv
+                    , _unavailableIdents  = Set.union reservedIdents (Set.fromList localEnv)
                     , _currentModule      = modname
                     })
 
@@ -256,13 +278,24 @@ asApplyAllRecognizer t = do _ <- asApp t
 withLocalLocalEnvironment :: TermTranslationMonad m => m a -> m a
 withLocalLocalEnvironment action = do
   env <- view localEnvironment <$> get
+  used <- view unavailableIdents <$> get
   result <- action
   modify $ set localEnvironment env
+  modify $ set unavailableIdents used
   return result
 
 mkDefinition :: Coq.Ident -> Coq.Term -> Coq.Decl
 mkDefinition name (Coq.Lambda bs t) = Coq.Definition name bs Nothing t
 mkDefinition name t = Coq.Definition name [] Nothing t
+
+-- | Make sure a name is not used in the current environment, adding
+-- or incrementing a numeric suffix until we find an unused name. When
+-- we get one, add it to the current environment and return it.
+freshenAndBindName :: TermTranslationMonad m => String -> m Coq.Ident
+freshenAndBindName n =
+  do n' <- translateLocalIdent n
+     modify $ over localEnvironment (n' :)
+     pure n'
 
 translateParams ::
   TermTranslationMonad m =>
@@ -270,19 +303,38 @@ translateParams ::
 translateParams [] = return []
 translateParams ((n, ty):ps) = do
   ty' <- translateTerm ty
-  modify $ over localEnvironment (n :)
+  n' <- freshenAndBindName n
   ps' <- translateParams ps
-  return (Coq.Binder n (Just ty') : ps')
+  return (Coq.Binder n' (Just ty') : ps')
 
 translatePi :: TermTranslationMonad m => [(String, Term)] -> Term -> m Coq.Term
 translatePi binders body = withLocalLocalEnvironment $ do
   bindersT <- forM binders $ \ (b, bType) -> do
     bTypeT <- translateTerm bType
-    modify $ over localEnvironment (b :)
-    let n = if b == "_" then Nothing else Just b
+    b' <- freshenAndBindName b
+    let n = if b == "_" then Nothing else Just b'
     return (Coq.PiBinder n bTypeT)
   bodyT <- translateTerm body
   return $ Coq.Pi bindersT bodyT
+
+-- | Translate a local name from a saw-core binder into a fresh Coq identifier.
+translateLocalIdent :: TermTranslationMonad m => String -> m Coq.Ident
+translateLocalIdent x =
+  do used <- view unavailableIdents <$> get
+     let ident0 = x -- TODO: use some string encoding to ensure lexically valid Coq identifiers
+     let findVariant i = if Set.member i used then findVariant (nextVariant i) else i
+     let ident = findVariant ident0
+     modify $ over unavailableIdents (Set.insert ident)
+     return ident
+
+nextVariant :: Coq.Ident -> Coq.Ident
+nextVariant = reverse . go . reverse
+  where
+    go :: String -> String
+    go (c : cs)
+      | c == '9'  = '0' : go cs
+      | isDigit c = succ c : cs
+    go cs = '1' : cs
 
 translateTerm :: TermTranslationMonad m => Term -> m Coq.Term
 translateTerm t = withLocalLocalEnvironment $ do
@@ -301,14 +353,11 @@ translateTerm t = withLocalLocalEnvironment $ do
 
     (asLambda -> Just _) -> do
       paramTerms <- translateParams params
-      Coq.Lambda <$> pure paramTerms
-                 -- env is in innermost first (reverse) binder order
-                 <*> go ((reverse paramNames) ++ env) e
+      e' <- translateTerm e
+      pure (Coq.Lambda paramTerms e')
         where
           -- params are in normal, outermost first, order
           (params, e) = asLambdaList t
-          -- param names are in normal, outermost first, order
-          paramNames = map fst $ params
 
     (asApp -> Just _) ->
       -- asApplyAll: innermost argument first
@@ -334,10 +383,10 @@ translateTerm t = withLocalLocalEnvironment $ do
           -- `rest` can be non-empty in examples like:
           -- (if b then f else g) arg1 arg2
           _ty : c : tt : ft : rest -> do
-            ite <- Coq.If <$> go env c <*> go env tt <*> go env ft
+            ite <- Coq.If <$> translateTerm c <*> translateTerm tt <*> translateTerm ft
             case rest of
               [] -> return ite
-              _  -> Coq.App ite <$> mapM (go env) rest
+              _  -> Coq.App ite <$> mapM translateTerm rest
           _ -> badTerm
         -- NOTE: the following works for something like CBC, because computing
         -- the n-th block only requires n steps of recursion
@@ -354,19 +403,23 @@ translateTerm t = withLocalLocalEnvironment $ do
 
               (asLambda -> Just (x, seqType, body)) | seqType == resultType ->
                   do
-                    len <- go env n
-                    expr <- go (x:env) body
-                    seqTypeT <- go env seqType
+                    len <- translateTerm n
+                    (x', expr) <-
+                      withLocalLocalEnvironment $
+                      do x' <- freshenAndBindName x
+                         expr <- translateTerm body
+                         pure (x', expr)
+                    seqTypeT <- translateTerm seqType
                     defaultValueT <- defaultTermForType resultType
                     let iter =
                           Coq.App (Coq.Var "iter")
                           [ len
-                          , Coq.Lambda [Coq.Binder x (Just seqTypeT)] expr
+                          , Coq.Lambda [Coq.Binder x' (Just seqTypeT)] expr
                           , defaultValueT
                           ]
                     case rest of
                       [] -> return iter
-                      _  -> Coq.App iter <$> mapM (go env) rest
+                      _  -> Coq.App iter <$> mapM translateTerm rest
               _ -> badTerm
             -- NOTE: there is currently one instance of `fix` that will trigger
             -- `errorTermM`.  It is used in `Cryptol.cry` when translating
@@ -379,22 +432,20 @@ translateTerm t = withLocalLocalEnvironment $ do
               case lambda of
               (asLambdaList -> ((recFn, _) : binders, body)) -> do
                 let (_binderPis, otherPis) = splitAt (length binders) pis
-                (bindersT, typeT, bodyT) <- withLocalLocalEnvironment $ do
+                (recFn', bindersT, typeT, bodyT) <- withLocalLocalEnvironment $ do
                   -- this is very ugly...
-                  modify $ over localEnvironment (recFn :)
+                  recFn' <- freshenAndBindName recFn
                   bindersT <- mapM
                     (\ (b, bType) -> do
-                      env' <- view localEnvironment <$> get
-                      bTypeT <- go env' bType
-                      modify $ over localEnvironment (b :)
-                      return $ Coq.Binder b (Just bTypeT)
+                      bTypeT <- translateTerm bType
+                      b' <- freshenAndBindName b
+                      return $ Coq.Binder b' (Just bTypeT)
                     )
                     binders
                   typeT <- translatePi otherPis afterPis
-                  env' <- view localEnvironment <$> get
-                  bodyT <- go env' body
-                  return (bindersT, typeT, bodyT)
-                let fix = Coq.Fix recFn bindersT typeT bodyT
+                  bodyT <- translateTerm body
+                  return (recFn', bindersT, typeT, bodyT)
+                let fix = Coq.Fix recFn' bindersT typeT bodyT
                 case rest of
                   [] -> return fix
                   _  -> errorTermM "THAT" -- Coq.App fix <$> mapM (go env) rest
@@ -402,7 +453,7 @@ translateTerm t = withLocalLocalEnvironment $ do
 
         _ ->
           translateIdentWithArgs i args
-      _ -> Coq.App <$> go env f <*> traverse (go env) args
+      _ -> Coq.App <$> translateTerm f <*> traverse translateTerm args
 
     (asLocalVar -> Just n)
       | n < length env -> Coq.Var <$> pure (env !! n)
@@ -417,7 +468,7 @@ translateTerm t = withLocalLocalEnvironment $ do
       if elem renamed alreadyTranslatedDecls || elem renamed definitionsToSkip
         then Coq.Var <$> pure renamed
         else do
-        b <- go env body
+        b <- translateTerm body
         modify $ over localDeclarations $ (mkDefinition renamed b :)
         Coq.Var <$> pure renamed
 
@@ -426,9 +477,6 @@ translateTerm t = withLocalLocalEnvironment $ do
 
   where
     badTerm          = Except.throwError $ BadTerm t
-    go env term      = do
-      modify $ set localEnvironment env
-      translateTerm term
 
 -- | In order to turn fixpoint computations into iterative computations, we need
 -- to be able to create "dummy" values at the type of the computation.  For now,
